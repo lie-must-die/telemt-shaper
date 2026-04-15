@@ -1,0 +1,33 @@
+[Unit]
+Description=telemt-shaper: VPN traffic shaper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/telemt-shaper/telemt-shaper.py
+
+# Перезапуск при падении, но не при штатном выходе
+Restart=on-failure
+RestartSec=10s
+
+# При остановке — SIGTERM, ждём до 30с graceful shutdown (снятие всех шейпов)
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+SendSIGKILL=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telemt-shaper
+
+User=root
+Group=root
+
+# Минимальный hardening
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
