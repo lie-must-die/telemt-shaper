@@ -2,7 +2,7 @@
 
 ![Latest Release](https://img.shields.io/github/v/release/lie-must-die/telemt-shaper?color=neon) ![Stars](https://img.shields.io/github/stars/lie-must-die/telemt-shaper?style=social)
 
-**Многоуровневый шейпер трафика для Telegram MTProto-прокси на базе [telemt](https://github.com/seriyps/mtproto_proxy).**
+**Многоуровневый шейпер трафика для Telegram MTProto-прокси на базе [telemt](https://github.com/telemt/telemt).**
 
 Отслеживает скорость каждого подключённого IP, и если кто-то начинает выжимать канал — автоматически режет ему скорость. Если клиент продолжает упираться в лимит — лимит ужесточается. Когда трафик утихает — шейп снимается.
 
