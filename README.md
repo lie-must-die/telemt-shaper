@@ -1,8 +1,6 @@
 # telemt-shaper
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
-[![Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#требования)
+![Latest Release](https://img.shields.io/github/v/release/lie-must-die/telemt-shaper?color=neon) ![Stars](https://img.shields.io/github/stars/lie-must-die/telemt-shaper?style=social)
 
 **Многоуровневый шейпер трафика для Telegram MTProto-прокси на базе [telemt](https://github.com/seriyps/mtproto_proxy).**
 
