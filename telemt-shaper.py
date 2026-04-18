@@ -73,6 +73,9 @@ UPGRADE_HEADROOM = _cfg("UPGRADE_HEADROOM", 0.9)
 COOLDOWN_SECS    = _cfg("COOLDOWN_SECS", 120)
 CHECK_INTERVAL   = _cfg("CHECK_INTERVAL", 5)
 STATE_TTL_SECS   = _cfg("STATE_TTL_SECS", 600)
+# Интервал heartbeat-лога "ЖМЁТ (финал)" для IP на последнем уровне шейпа
+# (количество тиков между сообщениями). 6 тиков × 5 сек = 30 сек.
+FINAL_HEARTBEAT_TICKS = _cfg("FINAL_HEARTBEAT_TICKS", 6)
 LOG_FILE         = _cfg("LOG_FILE", "/var/log/telemt-shaper.log")
 LOG_MAX_BYTES    = _cfg("LOG_MAX_BYTES", 10 * 1024 * 1024)
 LOG_BACKUP_COUNT = _cfg("LOG_BACKUP_COUNT", 3)
@@ -572,6 +575,7 @@ def process_ip(ip, bps, now):
         if bps < calm_threshold_bps:
             if state['calm_since'] is None:
                 state['calm_since'] = now
+                state['final_ticks'] = 0
                 log.info(f"Успокоился: {ip} ({mbps:.1f} Мбит/с) на L{cur_level} "
                          f"— ждём {COOLDOWN_SECS}с")
                 log_event("УСПОКОИЛСЯ", ip, f"{mbps:.1f} Mbit L{cur_level}")
@@ -580,6 +584,15 @@ def process_ip(ip, bps, now):
                 exceed_count[ip] = 0
         else:
             state['calm_since'] = None
+            # На финальном уровне нет ветки с "копим апгрейд" (некуда апгрейдиться),
+            # поэтому пока клиент продолжает жать — логируем heartbeat-ЖМЁТ,
+            # иначе между АПГРЕЙД и УСПОКОИЛСЯ в логе глухая тишина.
+            if not has_next and FINAL_HEARTBEAT_TICKS > 0:
+                state['final_ticks'] = state.get('final_ticks', 0) + 1
+                if state['final_ticks'] >= FINAL_HEARTBEAT_TICKS:
+                    state['final_ticks'] = 0
+                    log.info(f"Жмёт {ip} ({mbps:.1f} Мбит/с) на L{cur_level} (финал)")
+                    log_event("ЖМЁТ", ip, f"{mbps:.1f} Mbit L{cur_level} (финал)")
     else:
         l0 = SHAPE_LEVELS[0]
         l0_threshold_bps = l0["threshold_mbps"] * 1_000_000
@@ -597,6 +610,7 @@ def process_ip(ip, bps, now):
                         'level': 0,
                         'calm_since': None,
                         'upgrade_count': 0,
+                        'final_ticks': 0,
                     }
                 # Сбрасываем счётчик в любом случае: и при успехе (IP теперь
                 # в shaped_ips), и при неудаче (чтобы не крутить его в бесконечность;
