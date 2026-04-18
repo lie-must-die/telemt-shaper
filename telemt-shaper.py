@@ -49,6 +49,13 @@ def _cfg(name, default):
 # === НАСТРОЙКИ (дефолты, переопределяются через config.py) ===
 IFACE            = _cfg("IFACE", "ens18")
 
+# Ingress-шейпинг через ifb.
+# HTB как root qdisc шейпит только исходящий трафик. Для ограничения скорости
+# в обе стороны входящий трафик редиректится на виртуальное устройство ifb,
+# где применяется точно такая же HTB-иерархия.
+SHAPE_INGRESS    = _cfg("SHAPE_INGRESS", True)
+IFB_IFACE        = _cfg("IFB_IFACE", "ifb-telemt")
+
 # Уровни шейпа. Применяются по порядку:
 # - Чтобы попасть на L0 (первый шейп), IP должен превысить threshold_mbps[0]
 #   exceed_ticks[0] раз подряд.
@@ -244,22 +251,65 @@ def check_prerequisites():
                         f"Рекомендуется значение {math.floor(suggested)} и ниже.")
 
 
-def setup_htb():
-    r = run(["tc", "qdisc", "show", "dev", IFACE])
-    if "htb 1:" in r.stdout:
-        log.info(f"HTB на {IFACE} уже настроен — пропускаю bootstrap.")
-        return
-    log.info(f"Настраиваю HTB на {IFACE}...")
-    run(["tc", "qdisc", "del", "dev", IFACE, "root"])
-    r = run(["tc", "qdisc", "add", "dev", IFACE, "root", "handle", "1:",
+def _setup_htb_tree(iface):
+    """Строит дерево qdisc/class на интерфейсе: htb 1: (root) → 1:10 (10gbit, default) → fq."""
+    run(["tc", "qdisc", "del", "dev", iface, "root"])
+    r = run(["tc", "qdisc", "add", "dev", iface, "root", "handle", "1:",
              "htb", "default", "10", "r2q", "1"])
     if r.returncode != 0:
-        log.error(f"Не удалось создать корневой HTB: {r.stderr.strip()}")
+        log.error(f"Не удалось создать корневой HTB на {iface}: {r.stderr.strip()}")
         sys.exit(1)
-    run(["tc", "class", "add", "dev", IFACE, "parent", "1:", "classid", "1:10",
+    run(["tc", "class", "add", "dev", iface, "parent", "1:", "classid", "1:10",
          "htb", "rate", "10gbit", "quantum", "1514"])
-    run(["tc", "qdisc", "add", "dev", IFACE, "parent", "1:10", "fq"])
-    log.info("HTB готов.")
+    run(["tc", "qdisc", "add", "dev", iface, "parent", "1:10", "fq"])
+
+
+def _setup_ingress_redirect():
+    """Поднимает ifb-устройство, HTB на нём, ingress qdisc на IFACE и редирект."""
+    # 1. Модуль ifb
+    r = run(["modprobe", "ifb"])
+    if r.returncode != 0:
+        log.error(f"Не удалось загрузить модуль ifb: {r.stderr.strip()}")
+        log.error("Для ingress-шейпа нужен модуль ifb. "
+                  "Отключи SHAPE_INGRESS=False в config.py или установи модуль.")
+        sys.exit(1)
+
+    # 2. Виртуальное ifb-устройство (создаём с нашим именем, чтобы не конфликтовать
+    #    с ifb0/ifb1, которые могут быть заняты другими сервисами)
+    r = run(["ip", "link", "show", IFB_IFACE])
+    if r.returncode != 0:
+        r = run(["ip", "link", "add", "name", IFB_IFACE, "type", "ifb"])
+        if r.returncode != 0:
+            log.error(f"Не удалось создать {IFB_IFACE}: {r.stderr.strip()}")
+            sys.exit(1)
+    run(["ip", "link", "set", "dev", IFB_IFACE, "up"])
+
+    # 3. HTB-дерево на ifb (зеркало дерева на IFACE)
+    _setup_htb_tree(IFB_IFACE)
+
+    # 4. Ingress qdisc на IFACE и редирект всего трафика на ifb
+    run(["tc", "qdisc", "del", "dev", IFACE, "ingress"])
+    r = run(["tc", "qdisc", "add", "dev", IFACE, "handle", "ffff:", "ingress"])
+    if r.returncode != 0:
+        log.error(f"Не удалось создать ingress на {IFACE}: {r.stderr.strip()}")
+        sys.exit(1)
+    r = run(["tc", "filter", "add", "dev", IFACE, "parent", "ffff:", "protocol", "ip",
+             "u32", "match", "u32", "0", "0",
+             "action", "mirred", "egress", "redirect", "dev", IFB_IFACE])
+    if r.returncode != 0:
+        log.error(f"Не удалось настроить mirred-редирект на {IFB_IFACE}: {r.stderr.strip()}")
+        sys.exit(1)
+
+
+def setup_htb():
+    log.info(f"Настраиваю HTB на {IFACE}...")
+    _setup_htb_tree(IFACE)
+    if SHAPE_INGRESS:
+        log.info(f"Настраиваю ingress-редирект {IFACE} → {IFB_IFACE}...")
+        _setup_ingress_redirect()
+        log.info(f"HTB готов (egress: {IFACE}, ingress: {IFB_IFACE}).")
+    else:
+        log.info(f"HTB готов (только egress: {IFACE}).")
 
 
 # === СБОР СКОРОСТЕЙ ===
@@ -352,6 +402,25 @@ def filter_prio_for(cid):
     return FILTER_PRIO + cid - 100
 
 
+def _teardown_ip_tc(cid, prio):
+    """
+    Удаляет все tc-объекты для class_id на обеих интерфейсах.
+    Используется и для rollback, и для remove_shape. Ошибки игнорируются —
+    функция должна быть безопасна к вызову на частично уже удалённых объектах.
+    """
+    # IFACE (egress)
+    run(["tc", "filter", "del", "dev", IFACE, "parent", "1:",
+         "protocol", "ip", "prio", str(prio)])
+    run(["tc", "qdisc", "del", "dev", IFACE, "parent", f"1:{cid}"])
+    run(["tc", "class", "del", "dev", IFACE, "classid", f"1:{cid}"])
+    # IFB (ingress mirror)
+    if SHAPE_INGRESS:
+        run(["tc", "filter", "del", "dev", IFB_IFACE, "parent", "1:",
+             "protocol", "ip", "prio", str(prio)])
+        run(["tc", "qdisc", "del", "dev", IFB_IFACE, "parent", f"1:{cid}"])
+        run(["tc", "class", "del", "dev", IFB_IFACE, "classid", f"1:{cid}"])
+
+
 def add_shape(ip, level):
     cid = alloc_class_id()
     if cid is None:
@@ -362,6 +431,7 @@ def add_shape(ip, level):
     burst_kb = burst_kb_for(limit_mbps)
     prio = filter_prio_for(cid)
 
+    # На IFACE шейпим исходящий трафик (server → client), матчим по dst.
     cmds = [
         ["tc", "class", "add", "dev", IFACE, "parent", "1:10",
          "classid", f"1:{cid}", "htb",
@@ -373,20 +443,32 @@ def add_shape(ip, level):
          "protocol", "ip", "prio", str(prio), "u32",
          "match", "ip", "dst", f"{ip}/32", "flowid", f"1:{cid}"],
     ]
+    # На IFB шейпим входящий трафик (client → server), приходит после mirred-редиректа.
+    # В редиректе пакет сохраняет оригинальные src/dst, поэтому матчим по src.
+    if SHAPE_INGRESS:
+        cmds += [
+            ["tc", "class", "add", "dev", IFB_IFACE, "parent", "1:10",
+             "classid", f"1:{cid}", "htb",
+             "rate", f"{limit_mbps}mbit", "ceil", f"{limit_mbps}mbit",
+             "burst", f"{burst_kb}kb", "quantum", "1514"],
+            ["tc", "qdisc", "add", "dev", IFB_IFACE, "parent", f"1:{cid}", "cake",
+             "bandwidth", f"{limit_mbps}mbit"],
+            ["tc", "filter", "add", "dev", IFB_IFACE, "parent", "1:",
+             "protocol", "ip", "prio", str(prio), "u32",
+             "match", "ip", "src", f"{ip}/32", "flowid", f"1:{cid}"],
+        ]
 
     for cmd in cmds:
         r = run(cmd)
         if r.returncode != 0:
             log.error(f"Ошибка tc для {ip}: {' '.join(cmd)} → {r.stderr.strip()}")
-            run(["tc", "filter", "del", "dev", IFACE, "parent", "1:",
-                 "protocol", "ip", "prio", str(prio)])
-            run(["tc", "qdisc", "del", "dev", IFACE, "parent", f"1:{cid}"])
-            run(["tc", "class", "del", "dev", IFACE, "classid", f"1:{cid}"])
+            _teardown_ip_tc(cid, prio)
             free_class_id(cid)
             return None
 
+    dirs = "egress+ingress" if SHAPE_INGRESS else "egress"
     msg = f"L{level}: {limit_mbps} Mbit"
-    log.info(f"ШЕЙП: {ip} → {msg} (class 1:{cid})")
+    log.info(f"ШЕЙП: {ip} → {msg} (class 1:{cid}, {dirs})")
     log_event("ШЕЙП", ip, msg)
     return cid
 
@@ -397,14 +479,20 @@ def change_shape_level(ip, new_level):
     limit_mbps = SHAPE_LEVELS[new_level]["limit_mbps"]
     burst_kb = burst_kb_for(limit_mbps)
 
-    cmds = [
-        ["tc", "class", "change", "dev", IFACE, "parent", "1:10",
-         "classid", f"1:{cid}", "htb",
-         "rate", f"{limit_mbps}mbit", "ceil", f"{limit_mbps}mbit",
-         "burst", f"{burst_kb}kb", "quantum", "1514"],
-        ["tc", "qdisc", "change", "dev", IFACE, "parent", f"1:{cid}", "cake",
-         "bandwidth", f"{limit_mbps}mbit"],
-    ]
+    ifaces = [IFACE]
+    if SHAPE_INGRESS:
+        ifaces.append(IFB_IFACE)
+
+    cmds = []
+    for iface in ifaces:
+        cmds.append(
+            ["tc", "class", "change", "dev", iface, "parent", "1:10",
+             "classid", f"1:{cid}", "htb",
+             "rate", f"{limit_mbps}mbit", "ceil", f"{limit_mbps}mbit",
+             "burst", f"{burst_kb}kb", "quantum", "1514"])
+        cmds.append(
+            ["tc", "qdisc", "change", "dev", iface, "parent", f"1:{cid}", "cake",
+             "bandwidth", f"{limit_mbps}mbit"])
 
     for cmd in cmds:
         r = run(cmd)
@@ -426,10 +514,7 @@ def remove_shape(ip):
         return
     cid = info['class_id']
     prio = filter_prio_for(cid)
-    run(["tc", "filter", "del", "dev", IFACE, "parent", "1:",
-         "protocol", "ip", "prio", str(prio)])
-    run(["tc", "qdisc", "del", "dev", IFACE, "parent", f"1:{cid}"])
-    run(["tc", "class", "del", "dev", IFACE, "classid", f"1:{cid}"])
+    _teardown_ip_tc(cid, prio)
     log.info(f"СНЯТ шейп: {ip} (class 1:{cid})")
     log_event("СНЯТ", ip)
     free_class_id(cid)
@@ -513,7 +598,10 @@ def process_ip(ip, bps, now):
                         'calm_since': None,
                         'upgrade_count': 0,
                     }
-                    exceed_count[ip] = 0
+                # Сбрасываем счётчик в любом случае: и при успехе (IP теперь
+                # в shaped_ips), и при неудаче (чтобы не крутить его в бесконечность;
+                # если проблема не исчезнет — на следующие 3 тика накопится снова).
+                exceed_count[ip] = 0
         else:
             exceed_count[ip] = 0
 
