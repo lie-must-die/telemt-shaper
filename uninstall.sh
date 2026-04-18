@@ -85,16 +85,37 @@ fi
 # 6. PID-файл
 [[ -f "$PID_FILE" ]] && rm -f "$PID_FILE"
 
-# 7. Снять корневой HTB qdisc — опционально
+# 7. Снять корневой HTB qdisc, ingress-qdisc и ifb-устройство — опционально
 if command -v tc &>/dev/null; then
     echo
-    warn "Корневой HTB qdisc, созданный telemt-shaper, остался на интерфейсе."
-    read -rp "Снести его (tc qdisc del dev <iface> root)? Укажите интерфейс или Enter чтобы пропустить: " iface </dev/tty
+    warn "На интерфейсе остались tc-объекты, созданные telemt-shaper (HTB qdisc, ingress, ifb)."
+    read -rp "Снести их? Укажите интерфейс или Enter чтобы пропустить: " iface </dev/tty
     if [[ -n "$iface" ]]; then
+        # Корневой HTB qdisc
         if tc qdisc del dev "$iface" root 2>/dev/null; then
             ok "HTB qdisc снят с $iface"
         else
-            warn "Не удалось снять qdisc с $iface (возможно его уже нет)"
+            warn "HTB qdisc на $iface не найден или уже снят"
+        fi
+        # Ingress qdisc (для ifb-редиректа)
+        if tc qdisc del dev "$iface" ingress 2>/dev/null; then
+            ok "Ingress qdisc снят с $iface"
+        fi
+    fi
+
+    # ifb-устройство (имя по умолчанию, либо из config.py если сохранили)
+    IFB_IFACE="ifb-telemt"
+    if [[ -f "$INSTALL_DIR/config.py" ]]; then
+        CFG_IFB=$(grep -E '^\s*IFB_IFACE\s*=' "$INSTALL_DIR/config.py" 2>/dev/null \
+                  | head -1 | sed -E 's/.*=\s*"([^"]+)".*/\1/' | head -1)
+        [[ -n "$CFG_IFB" ]] && IFB_IFACE="$CFG_IFB"
+    fi
+    if ip link show "$IFB_IFACE" &>/dev/null; then
+        read -rp "Удалить ifb-устройство $IFB_IFACE? [y/N] " -n 1 ans </dev/tty
+        echo
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            ip link del "$IFB_IFACE" 2>/dev/null && ok "ifb-устройство $IFB_IFACE удалено" \
+                || warn "Не удалось удалить $IFB_IFACE"
         fi
     fi
 fi
