@@ -336,6 +336,22 @@ def free_class_id(cid):
     free_class_ids.append(cid)
 
 
+def filter_prio_for(cid):
+    """
+    Возвращает уникальный prio для фильтра данного class_id.
+
+    ПОЧЕМУ это важно: `tc filter del ... prio N` удаляет ВСЕ фильтры на указанном
+    prio за один раз (аргументы `match ip dst X` и `flowid Y` в del-команде
+    игнорируются ядром). Если все фильтры вешать на один prio — первый же
+    remove_shape снесёт фильтры всех шейпнутых IP разом. Поэтому каждому
+    class_id назначаем отдельный prio.
+
+    Диапазон prio — 16-битный (1..65535). FILTER_PRIO — базовый prio (по умолчанию 10),
+    cid начинается со 100, значит prio = 10, 11, 12, ... Запас огромный.
+    """
+    return FILTER_PRIO + cid - 100
+
+
 def add_shape(ip, level):
     cid = alloc_class_id()
     if cid is None:
@@ -344,6 +360,7 @@ def add_shape(ip, level):
 
     limit_mbps = SHAPE_LEVELS[level]["limit_mbps"]
     burst_kb = burst_kb_for(limit_mbps)
+    prio = filter_prio_for(cid)
 
     cmds = [
         ["tc", "class", "add", "dev", IFACE, "parent", "1:10",
@@ -353,7 +370,7 @@ def add_shape(ip, level):
         ["tc", "qdisc", "add", "dev", IFACE, "parent", f"1:{cid}", "cake",
          "bandwidth", f"{limit_mbps}mbit"],
         ["tc", "filter", "add", "dev", IFACE, "parent", "1:",
-         "protocol", "ip", "prio", str(FILTER_PRIO), "u32",
+         "protocol", "ip", "prio", str(prio), "u32",
          "match", "ip", "dst", f"{ip}/32", "flowid", f"1:{cid}"],
     ]
 
@@ -362,8 +379,7 @@ def add_shape(ip, level):
         if r.returncode != 0:
             log.error(f"Ошибка tc для {ip}: {' '.join(cmd)} → {r.stderr.strip()}")
             run(["tc", "filter", "del", "dev", IFACE, "parent", "1:",
-                 "protocol", "ip", "prio", str(FILTER_PRIO),
-                 "u32", "match", "ip", "dst", f"{ip}/32", "flowid", f"1:{cid}"])
+                 "protocol", "ip", "prio", str(prio)])
             run(["tc", "qdisc", "del", "dev", IFACE, "parent", f"1:{cid}"])
             run(["tc", "class", "del", "dev", IFACE, "classid", f"1:{cid}"])
             free_class_id(cid)
@@ -409,9 +425,9 @@ def remove_shape(ip):
     if not info:
         return
     cid = info['class_id']
+    prio = filter_prio_for(cid)
     run(["tc", "filter", "del", "dev", IFACE, "parent", "1:",
-         "protocol", "ip", "prio", str(FILTER_PRIO),
-         "u32", "match", "ip", "dst", f"{ip}/32", "flowid", f"1:{cid}"])
+         "protocol", "ip", "prio", str(prio)])
     run(["tc", "qdisc", "del", "dev", IFACE, "parent", f"1:{cid}"])
     run(["tc", "class", "del", "dev", IFACE, "classid", f"1:{cid}"])
     log.info(f"СНЯТ шейп: {ip} (class 1:{cid})")
