@@ -258,7 +258,7 @@ def _setup_htb_tree(iface):
     """Строит дерево qdisc/class на интерфейсе: htb 1: (root) → 1:10 (10gbit, default) → fq."""
     run(["tc", "qdisc", "del", "dev", iface, "root"])
     r = run(["tc", "qdisc", "add", "dev", iface, "root", "handle", "1:",
-             "htb", "default", "10", "r2q", "1"])
+             "htb", "default", "10", "r2q", "1", "direct_qlen", "10000"])
     if r.returncode != 0:
         log.error(f"Не удалось создать корневой HTB на {iface}: {r.stderr.strip()}")
         sys.exit(1)
